@@ -1,0 +1,9 @@
+
+# data never goes in git
+*.csv
+!genai_augmentation/results/*.csv
+*.pkl
+*.parquet
+*.npz
+*.pt
+*.model
