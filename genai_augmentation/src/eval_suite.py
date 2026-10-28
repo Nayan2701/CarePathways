@@ -32,10 +32,10 @@ from sklearn.metrics import roc_auc_score, average_precision_score, precision_re
 DIRECTION = {
     "ks_mean": 1, "target_wasserstein": 1, "tv_cat_mean": 1, "tv_cat_max": 1, "bin_prev_err_mean": 1, "bin_prev_err_max": 1,
     "assoc_diff_mean": 1, "disc_auc": 0, "mmd": 1,
-    "precision": -1, "recall": -1, "density": 0, "coverage": -1, "authenticity": -1,
+    "precision": -1, "density": 0, "coverage": -1, "authenticity": -1,
     "tail_q_err_mean": 1, "exceed_err_mean": 1, "es90_rel_err": 1, "gpd_xi_diff": 1,
     "sub_mass_err_mean": 1, "sub_mass_err_max": 1, "sub_mass_err_extreme": 1, "sub_presence": -1,
-    "sub_cov_mean": -1, "sub_cov_min": -1,
+    "sub_cov_mean": -1, "sub_cov_min": -1, "sub_min_share_ratio": -1,
     "dcr_ratio": -1, "dcr_p05_ratio": -1, "nndr_median": -1, "exact_copies": 1, "mia_auc": 1,
     "invalid_rate": 1,
 }
@@ -139,14 +139,19 @@ def association_metrics(s, R, S):
 
 
 # ---------------------------------------------------------------- global distribution tests
-def discriminator_auc(XR, XS, seed=0, folds=5):
+def discriminator_auc(XR, XS, seed=0, folds=5, gR=None, gS=None):
     """Classifier two-sample test: out-of-fold AUC of a real-vs-synthetic classifier on equal-size samples.
-    0.5 = indistinguishable; report also |AUC - 0.5|."""
+    0.5 = indistinguishable. Folds are grouped by patient (gR, gS = patient ids; None = every row its own
+    group), so the classifier cannot score well by memorising a patient whose other stays are in training."""
+    from sklearn.model_selection import StratifiedGroupKFold
     rng = np.random.default_rng(seed); n = min(len(XR), len(XS))
-    XR, XS = XR[rng.choice(len(XR), n, replace=False)], XS[rng.choice(len(XS), n, replace=False)]
-    X, y = np.vstack([XR, XS]), np.r_[np.zeros(n), np.ones(n)]
+    iR, iS = rng.choice(len(XR), n, replace=False), rng.choice(len(XS), n, replace=False)
+    XR, XS = XR[iR], XS[iS]
+    gR = np.asarray(gR)[iR].astype(str) if gR is not None else np.array([f"r{i}" for i in iR])
+    gS = np.asarray(gS)[iS].astype(str) if gS is not None else np.array([f"s{i}" for i in iS])
+    X, y, g = np.vstack([XR, XS]), np.r_[np.zeros(n), np.ones(n)], np.r_[["R_" + x for x in gR], ["S_" + x for x in gS]]
     oof = np.zeros(len(y))
-    for tr, te in StratifiedKFold(folds, shuffle=True, random_state=seed).split(X, y):
+    for tr, te in StratifiedGroupKFold(folds, shuffle=True, random_state=seed).split(X, y, g):
         m = HistGradientBoostingClassifier(max_iter=150, learning_rate=0.1, random_state=seed).fit(X[tr], y[tr])
         oof[te] = m.predict_proba(X[te])[:, 1]
     return roc_auc_score(y, oof)
@@ -237,7 +242,7 @@ def tail_metrics(s, R, S, qs=(0.5, 0.75, 0.9, 0.95, 0.99)):
 
 
 # ---------------------------------------------------------------- subgroups (operational metrics recommended by both reviews)
-def subgroup_metrics(s, R, S, XR, XS, k=5, k_min=5, extreme_q=0.9, min_extreme=20):
+def subgroup_metrics(s, R, S, XR, XS, k=5, k_min=5, extreme_q=0.9, min_extreme=20, S_full=None, real_shares=None):
     if not s.groups: return {}
     def mass(D):
         f = pd.DataFrame({g: D[c].astype(float).max(1) for g, c in s.groups.items()}, index=D.index)
@@ -259,6 +264,11 @@ def subgroup_metrics(s, R, S, XR, XS, k=5, k_min=5, extreme_q=0.9, min_extreme=2
            "sub_mass_err_extreme": float(ext), "sub_presence": float(pres),
            "sub_cov_mean": float(np.mean(covs)) if covs else np.nan, "sub_cov_min": float(np.min(covs)) if covs else np.nan}
     for g in fR.columns: out[f"share_{g}"] = float(fS[g].mean())
+    if S_full is not None and real_shares is not None:
+        # smallest ratio (synthetic share / real share) over groups, on the FULL synthetic sample:
+        # 0 = a subgroup is missing entirely, 1 = represented at its real rate
+        fF = mass(S_full)
+        out["sub_min_share_ratio"] = float(min(fF[g].mean() / max(real_shares[g], 1e-9) for g in s.groups))
     return out
 
 
@@ -278,26 +288,30 @@ def validity_metrics(s, T, S, rules=None):
 
 
 # ---------------------------------------------------------------- one call for everything
-def evaluate(s, T, R, S, enc=None, bandwidth=None, k=5, seed=0, rules=None):
+def evaluate(s, T, R, S, enc=None, bandwidth=None, k=5, seed=0, rules=None, R_ids=None, S_ids=None, valid_ref=None):
     """T = generator training rows (real rare class), R = held-out real rare class, S = synthetic.
     Fidelity is S vs R; privacy is S vs T with R as non-member control. S is subsampled to len(R) for the
     sample-size-sensitive metrics (PRDC, MMD, discriminator) so every model is compared at the same size."""
     enc = enc or Encoder(s, T)
     rng = np.random.default_rng(seed)
-    S_eq = S.iloc[rng.choice(len(S), min(len(S), len(R)), replace=False)].reset_index(drop=True)
+    iq = rng.choice(len(S), min(len(S), len(R)), replace=False)
+    S_eq = S.iloc[iq].reset_index(drop=True)
+    S_ids_eq = np.asarray(S_ids)[iq] if S_ids is not None else None
     XT, XR, XS, XSe = enc(T), enc(R), enc(S), enc(S_eq)
     bandwidth = bandwidth or median_bandwidth(XR)
     out = {"n_syn": len(S)}
     out.update(marginal_metrics(s, R, S))
     out.update(association_metrics(s, R, S))
-    out["disc_auc"] = discriminator_auc(XR, XSe, seed=seed)
+    out["disc_auc"] = discriminator_auc(XR, XSe, seed=seed, gR=R_ids, gS=S_ids_eq)
     out["mmd"] = mmd_rbf(XR, XSe, bandwidth, seed=seed)
     out.update(prdc(XR, XSe, k=k))
     out["authenticity"] = authenticity(XT, XS)
     out.update(tail_metrics(s, R, S))
-    out.update(subgroup_metrics(s, R, S_eq, XR, XSe, k=k))
+    pooled = pd.concat([T, R], ignore_index=True)
+    shares = {g: float(pooled[c].astype(float).max(1).mean()) for g, c in s.groups.items()}
+    out.update(subgroup_metrics(s, R, S_eq, XR, XSe, k=k, S_full=S, real_shares=shares))
     out.update(privacy_metrics(XT, XR, XS, seed=seed))
-    out.update(validity_metrics(s, T, S, rules))
+    out.update(validity_metrics(s, valid_ref if valid_ref is not None else T, S, rules))
     return out
 
 
@@ -322,8 +336,7 @@ def reference_band(s, T, real_pool, n_ref, reps=20, q=0.95, seed=0, patient_ids=
         m = np.array([i in half for i in ids])
         R = real_pool[m].reset_index(drop=True)
         S = real_pool[~m].reset_index(drop=True)
-        S = S.iloc[rng.choice(len(S), n_ref, replace=True)].reset_index(drop=True) if n_ref > len(S) else S
-        rows.append(evaluate(s, T, R, S, seed=seed + r, **kw))
+        rows.append(evaluate(s, T, R, S, seed=seed + r, R_ids=ids[m], S_ids=ids[~m], **kw))
     ref = pd.DataFrame(rows)
     thr = {c: np.nanquantile([badness(c, v) for v in ref[c]], q) for c in ref.columns if c in DIRECTION}
     return ref, thr
@@ -336,7 +349,7 @@ def detected(result, thr, margin=0.0):
 
 # ---------------------------------------------------------------- utility: augmentation gain
 def augmentation_gain(make_X, train, syn, val, test, label="is_plos", group="subject_id", p0=0.5,
-                      n_boot=1000, seed=0):
+                      n_boot=1000, seed=0, aug_weight=None):
     """Train the same classifier on real-only vs real+synthetic; evaluate both on the same real test patients.
     Average precision (AP) and recall at a precision floor p0 (threshold chosen on validation, then frozen).
     Paired bootstrap over test PATIENTS (all their stays together) gives a 95% CI for the AP gain."""
@@ -347,7 +360,11 @@ def augmentation_gain(make_X, train, syn, val, test, label="is_plos", group="sub
     def fit(X, y):
         return HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, random_state=seed).fit(X, y)
     m0 = fit(Xtr, ytr)
-    m1 = fit(pd.concat([Xtr, Xsy], ignore_index=True), np.r_[ytr, np.ones(len(Xsy), int)])
+    if aug_weight == "balanced":   # baseline: real data only, class weighting instead of synthetic rows
+        m1 = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.05, random_state=seed,
+                                            class_weight="balanced").fit(Xtr, ytr)
+    else:
+        m1 = fit(pd.concat([Xtr, Xsy], ignore_index=True), np.r_[ytr, np.ones(len(Xsy), int)])
     out = {}
     preds = {}
     for name, m in [("real", m0), ("aug", m1)]:
